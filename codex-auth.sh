@@ -14,22 +14,28 @@ set -euo pipefail
 #     windows fetched from ChatGPT's usage API and cached subscription dates.
 #   - `codex-auth switch` shows the same list followed by an email-based
 #     account picker (↑/↓ move, Enter confirm, q quit) that writes the
-#     selected credential back to ~/.codex/auth.json.
+#     selected credential back to ~/.codex/auth.json. When the account changes,
+#     the installation_id beside auth.json is removed; restart Codex to have
+#     it generate a new ID. Running instances keep their in-memory ID.
 #   - `codex-auth remove` uses the picker to delete an inactive account from
 #     the pool after confirmation. The active account must be switched first.
+#   - `codex-auth refresh` runs Codex's supported refresh flow for stale
+#     ChatGPT credentials in the pool, without changing the selected account.
 #   - `codex-auth login` prepares a NEW account login: the live credential is
 #     backed up into the pool first, auth.json is removed so the device-auth
 #     flow starts clean (otherwise the browser just re-authorizes the account
 #     it is already signed into), then the real `codex login` runs and the
 #     resulting credential is captured back into the pool automatically. A
 #     live credential whose mode the pool cannot store is never deleted.
-#   - Sessions and history are never touched. config.toml may be updated only
-#     to enforce cli_auth_credentials_store = "file"; account state changes
-#     are confined to auth.json and auth-poll.json.
+#   - Sessions and history are never touched. config.toml may be updated to
+#     enforce cli_auth_credentials_store = "file" and disable
+#     features.daemon_auto_start; account state changes are confined to
+#     auth.json, auth-poll.json, and installation_id.
 
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 POOL_FILE="${AUTH_POOL_FILE:-$HOME/.codex/auth-poll.json}"
 CONFIG_TOML="${CONFIG_TOML:-$HOME/.codex/config.toml}"
+AUTH_REFRESH_STALE_SECONDS=$((8 * 24 * 60 * 60))
 
 # Forward proxy settings to curl and the Codex CLI. Keep explicitly supplied
 # uppercase values; accept the common lowercase spellings as a fallback.
@@ -56,6 +62,10 @@ if [[ $# -ge 1 ]]; then
       MODE="remove"
       shift
       ;;
+    refresh)
+      MODE="refresh"
+      shift
+      ;;
   esac
 fi
 
@@ -65,7 +75,7 @@ if [[ $# -ge 1 ]]; then
   if [[ "$1" == *.json || "$1" == */* ]]; then
     POOL_FILE="$1"
   else
-    echo "Error: unknown command: $1 (supported: login, switch, remove, or run without arguments)" >&2
+    echo "Error: unknown command: $1 (supported: login, switch, remove, refresh, or run without arguments)" >&2
     exit 1
   fi
 fi
@@ -101,6 +111,12 @@ cleanup() {
   fi
   if [[ -n "${TMP_REMOVE_FILE:-}" && -f "${TMP_REMOVE_FILE:-}" ]]; then
     rm -f "$TMP_REMOVE_FILE"
+  fi
+  if [[ -n "${TMP_REFRESH_FILE:-}" && -f "${TMP_REFRESH_FILE:-}" ]]; then
+    rm -f "$TMP_REFRESH_FILE"
+  fi
+  if [[ -n "${REFRESH_HOME:-}" && -d "${REFRESH_HOME:-}" ]]; then
+    rm -rf -- "$REFRESH_HOME"
   fi
   if [[ -n "${RESULTS_FILE:-}" && -f "${RESULTS_FILE:-}" ]]; then
     rm -f "$RESULTS_FILE"
@@ -148,8 +164,9 @@ is_current_auth() {
   [[ -n "$id" && "$id" == "$CURRENT_AUTH_IDENTITY" ]]
 }
 
-validate_current_auth_file() {
-  if ! jq -e '
+validate_auth_file() {
+  local auth_file="$1"
+  jq -e '
     type == "object"
     and (
       (
@@ -176,7 +193,11 @@ validate_current_auth_file() {
         and (.OPENAI_API_KEY | length > 0)
       )
     )
-  ' "$CURRENT_AUTH_FILE" > /dev/null; then
+  ' "$auth_file" > /dev/null
+}
+
+validate_current_auth_file() {
+  if ! validate_auth_file "$CURRENT_AUTH_FILE"; then
     echo "Error: current auth file is not a valid chatgpt/apikey auth.json: $CURRENT_AUTH_FILE" >&2
     exit 1
   fi
@@ -193,28 +214,12 @@ ensure_pool_file() {
   fi
 }
 
-upsert_current_auth_if_present() {
-  # If a live credential file exists, add/refresh its entry in the pool
-  # (keyed by identity). When no auth.json exists (not logged in), do
-  # nothing — list/switch still work so a pooled credential can be restored.
-  [[ -f "$CURRENT_AUTH_FILE" ]] || return 0
-
-  # Only chatgpt and apikey modes are pooled. Other modes (PAT, headers,
-  # agentIdentity, bedrockApiKey, ...) are warned about and skipped: they
-  # never reach the pool, so login refuses to delete them.
-  local live_mode
-  live_mode="$(get_auth_mode "$(cat "$CURRENT_AUTH_FILE")")"
-  if [[ "$live_mode" != "chatgpt" && "$live_mode" != "apikey" ]]; then
-    printf "${YELLOW}[auth] unsupported auth_mode '%s' — skipped pool upsert${RESET}\n" "$live_mode"
-    return 0
-  fi
-
-  validate_current_auth_file
+upsert_auth_file() {
+  local auth_file="$1"
   ensure_pool_file
-
   TMP_UPSERT_FILE="$(mktemp)"
 
-  jq --slurpfile new_auth "$CURRENT_AUTH_FILE" '
+  jq --slurpfile new_auth "$auth_file" '
     def auth_identity($a):
       if (($a.auth_mode // "apikey")) == "chatgpt" then
         ($a.tokens.account_id // "")
@@ -244,6 +249,139 @@ upsert_current_auth_if_present() {
   mv "$TMP_UPSERT_FILE" "$POOL_FILE"
   chmod 600 "$POOL_FILE"
   unset TMP_UPSERT_FILE
+}
+
+upsert_current_auth_if_present() {
+  # If a live credential file exists, add/refresh its entry in the pool
+  # (keyed by identity). When no auth.json exists (not logged in), do
+  # nothing — list/switch still work so a pooled credential can be restored.
+  [[ -f "$CURRENT_AUTH_FILE" ]] || return 0
+
+  # Only chatgpt and apikey modes are pooled. Other modes (PAT, headers,
+  # agentIdentity, bedrockApiKey, ...) are warned about and skipped: they
+  # never reach the pool, so login refuses to delete them.
+  local live_mode
+  live_mode="$(get_auth_mode "$(cat "$CURRENT_AUTH_FILE")")"
+  if [[ "$live_mode" != "chatgpt" && "$live_mode" != "apikey" ]]; then
+    printf "${YELLOW}[auth] unsupported auth_mode '%s' — skipped pool upsert${RESET}\n" "$live_mode"
+    return 0
+  fi
+
+  validate_current_auth_file
+  upsert_auth_file "$CURRENT_AUTH_FILE"
+}
+
+auth_needs_refresh() {
+  local raw="$1" last_refresh refreshed_at now
+  last_refresh="$(jq -r '.last_refresh // empty' <<<"$raw")"
+  [[ -n "$last_refresh" ]] || return 0
+
+  if ! refreshed_at="$(python3 - "$last_refresh" 2>/dev/null <<'PYEOF'
+import datetime
+import re
+import sys
+
+timestamp = re.sub(r"\.\d+(?=(?:Z|[+-]\d{2}:\d{2})$)", "", sys.argv[1])
+if timestamp.endswith("Z"):
+    timestamp = timestamp[:-1] + "+00:00"
+parsed = datetime.datetime.fromisoformat(timestamp)
+if parsed.tzinfo is None:
+    parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+print(int(parsed.timestamp()))
+PYEOF
+)"; then
+    return 0
+  fi
+  [[ "$refreshed_at" =~ ^[0-9]+$ ]] || return 0
+  now="$(date +%s)"
+  (( now - refreshed_at >= AUTH_REFRESH_STALE_SECONDS ))
+}
+
+refresh_pool_account() {
+  local raw="$1" expected_identity refreshed_raw refreshed_identity refresh_status
+  expected_identity="$(get_auth_identity "$raw")"
+  [[ -n "$expected_identity" ]] || return 1
+
+  REFRESH_HOME="$(mktemp -d "$(dirname -- "$POOL_FILE")/.codex-auth-refresh.XXXXXX")"
+  chmod 700 "$REFRESH_HOME"
+  printf '%s\n' "$raw" > "$REFRESH_HOME/auth.json"
+  chmod 600 "$REFRESH_HOME/auth.json"
+
+  refresh_status=0
+  CODEX_HOME="$REFRESH_HOME" codex exec \
+    --ephemeral --ignore-user-config --ignore-rules --color never -s read-only \
+    -c 'cli_auth_credentials_store = "file"' \
+    -c 'features.daemon_auto_start = false' \
+    'Reply with the single word OK.' > /dev/null 2>&1 < /dev/null || refresh_status=$?
+
+  if ! validate_auth_file "$REFRESH_HOME/auth.json"; then
+    rm -rf -- "$REFRESH_HOME"
+    unset REFRESH_HOME
+    return 1
+  fi
+  refreshed_raw="$(cat "$REFRESH_HOME/auth.json")"
+  refreshed_identity="$(get_auth_identity "$refreshed_raw")"
+  if [[ "$refreshed_identity" != "$expected_identity" ]] || auth_needs_refresh "$refreshed_raw"; then
+    rm -rf -- "$REFRESH_HOME"
+    unset REFRESH_HOME
+    return 1
+  fi
+
+  upsert_auth_file "$REFRESH_HOME/auth.json"
+  if [[ "$refreshed_identity" == "${CURRENT_AUTH_IDENTITY:-}" && -f "$CURRENT_AUTH_FILE" ]]; then
+    TMP_REFRESH_FILE="$(mktemp "${CURRENT_AUTH_FILE}.tmp.XXXXXX")"
+    cp "$REFRESH_HOME/auth.json" "$TMP_REFRESH_FILE"
+    chmod 600 "$TMP_REFRESH_FILE"
+    mv "$TMP_REFRESH_FILE" "$CURRENT_AUTH_FILE"
+    unset TMP_REFRESH_FILE
+  fi
+
+  rm -rf -- "$REFRESH_HOME"
+  unset REFRESH_HOME
+  if (( refresh_status != 0 )); then
+    printf "${YELLOW}[refresh] Codex refreshed the credentials, but its maintenance run exited %d.${RESET}\n" "$refresh_status"
+  fi
+  return 0
+}
+
+refresh_pool_auth() {
+  local account mode label refreshed current skipped failed
+  refreshed=0
+  current=0
+  skipped=0
+  failed=0
+
+  if ! command -v codex >/dev/null 2>&1; then
+    echo "Error: codex CLI not found — install it first." >&2
+    return 1
+  fi
+
+  while IFS= read -r account; do
+    [[ -n "$account" ]] || continue
+    mode="$(get_auth_mode "$account")"
+    if [[ "$mode" != "chatgpt" ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if ! auth_needs_refresh "$account"; then
+      current=$((current + 1))
+      continue
+    fi
+
+    label="$(get_auth_label "$account")"
+    printf "${DIM}[refresh] refreshing %s...${RESET}\n" "$label"
+    if refresh_pool_account "$account"; then
+      refreshed=$((refreshed + 1))
+      printf "${GREEN}[refresh] %s refreshed.${RESET}\n" "$label"
+    else
+      failed=$((failed + 1))
+      printf "${RED}[refresh] %s could not be refreshed; run codex-auth login for that account.${RESET}\n" "$label" >&2
+    fi
+  done < <(jq -c '.[]' "$POOL_FILE")
+
+  printf "${DIM}[refresh] %d refreshed, %d current, %d non-ChatGPT skipped, %d failed.${RESET}\n" \
+    "$refreshed" "$current" "$skipped" "$failed"
+  [[ "$failed" -eq 0 ]]
 }
 
 # ------------- formatting helpers -------------
@@ -475,6 +613,9 @@ fetch_usage_for_account() {
     return
   fi
 
+  # Match Codex's account-scoped backend requests. A user token can access
+  # multiple workspaces; without this header /wham/usage may return the
+  # default workspace's quota instead of this pool entry's quota.
   tmp_body="$(mktemp)"
   http_code="$(
     curl -sS \
@@ -484,6 +625,7 @@ fetch_usage_for_account() {
       -H 'accept: */*' \
       -H 'accept-language: en-GB,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,en-US;q=0.6,ja;q=0.5' \
       -H "authorization: Bearer $access_token" \
+      -H "ChatGPT-Account-Id: $account_id" \
       -H 'priority: u=1, i' \
       -H 'referer: https://chatgpt.com/codex/settings/usage' \
       -H 'sec-ch-ua: "Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"' \
@@ -577,6 +719,7 @@ fetch_usage_for_account() {
         "$RESET_CREDITS_URL" \
         -H 'accept: */*' \
         -H "authorization: Bearer $access_token" \
+        -H "ChatGPT-Account-Id: $account_id" \
         -H 'referer: https://chatgpt.com/codex/settings/usage' \
         -H 'x-openai-target-path: /backend-api/wham/rate-limit-reset-credits' \
         2>/dev/null \
@@ -918,7 +1061,8 @@ remove_pool_account() {
 }
 
 run_merged() {
-  local sorted_json count selected key item target_label is_current confirm previous_selected
+  local sorted_json count selected key item target_label is_current confirm installation_id_file
+  local previous
 
   sorted_json="$(sort_results_to_json)"
   count="$(jq 'length' <<<"$sorted_json")"
@@ -934,18 +1078,22 @@ run_merged() {
     return 1
   fi
 
-  # Usage-only mode, or non-interactive switch → show the list only.
+  # Usage-only mode, or a non-interactive picker → show the list only.
   if [[ "$MODE" == "list" || ! -t 0 ]]; then
     render_list_lines "$sorted_json"
     return 0
   fi
 
   selected=0
+  printf "\033[H\033[J"
   render_list_lines "$sorted_json"
   printf "\n${BOLD}Select account to %s${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n" "$MODE"
-  render_picker_lines "$selected" "$sorted_json"
+  # Keep each option on one physical row so moving back by $count rows works
+  # even when an email exceeds the terminal width.
+  printf '\033[?7l%s\n\033[?7h' "$(render_picker_lines "$selected" "$sorted_json")"
 
   while true; do
+    previous="$selected"
     IFS= read -rsn1 key || { printf "\n"; return 0; }
 
     if [[ "$key" == "q" || "$key" == "Q" ]]; then
@@ -976,26 +1124,28 @@ run_merged() {
       fi
 
       if [[ "$is_current" == "true" ]]; then
-        # Enter on the active account: nothing changes; show the outcome in
-        # the same dim style as the cancel message.
+        printf "\033[H\033[J"
         printf "${DIM}Current account: %s${RESET}\n" "$target_label"
         return 0
       fi
 
+      printf "\033[H\033[J"
       jq '.raw_auth' <<<"$item" > "$CURRENT_AUTH_FILE"
       chmod 600 "$CURRENT_AUTH_FILE"
 
       CURRENT_AUTH_IDENTITY="$(get_auth_identity "$(cat "$CURRENT_AUTH_FILE")")"
 
-      # One-line outcome, same shape as the unchanged case; the orange email
-      # is what marks that a switch happened.
       printf "Current account: ${ORANGE}%s${RESET}\n" "$target_label"
+      installation_id_file="$(dirname -- "$CURRENT_AUTH_FILE")/installation_id"
+      if ! rm -f -- "$installation_id_file" 2>/dev/null; then
+        printf '%bAccount switched, but could not remove installation ID: %s%b\n' \
+          "$YELLOW" "$installation_id_file" "$RESET" >&2
+      fi
       return 0
     fi
 
     if [[ "$key" == $'\x1b' ]]; then
       IFS= read -rsn2 key || true
-      previous_selected=$selected
       case "$key" in
         "[A")
           (( selected > 0 )) && selected=$((selected - 1))
@@ -1004,11 +1154,12 @@ run_merged() {
           (( selected < count - 1 )) && selected=$((selected + 1))
           ;;
       esac
-      if (( selected != previous_selected )); then
-        # Redraw only the short picker; the usage list stays on screen.
-        printf '\033[%dA' "$count"
-        render_picker_lines "$selected" "$sorted_json"
-      fi
+    fi
+
+    if [[ "$selected" -ne "$previous" ]]; then
+      # Return to the picker, leaving the usage list above it untouched.
+      printf '\033[%dA\r\033[J\033[?7l%s\n\033[?7h' \
+        "$count" "$(render_picker_lines "$selected" "$sorted_json")"
     fi
   done
 }
@@ -1056,6 +1207,64 @@ ensure_file_store_config() {
   printf "${YELLOW}[config] added cli_auth_credentials_store = \"file\"${RESET}\n"
 }
 
+ensure_daemon_auto_start_disabled() {
+  # Keep sessions on separate accounts by disabling the shared daemon.
+  local cfg="$CONFIG_TOML" input tmpfile
+
+  input="$cfg"
+  if [[ ! -f "$cfg" ]]; then
+    mkdir -p -- "$(dirname -- "$cfg")"
+    input=/dev/null
+  fi
+  tmpfile="$(mktemp "${cfg}.XXXXXX")"
+
+  # Insert the flag before trailing blank lines in [features], or add the
+  # table if missing. Buffer blank lines so section spacing stays below it.
+  # Only match keys in that table; other tables may contain the same name.
+  if ! awk '
+    /^[[:space:]]*\[/ {
+      if (in_features && !found_key) {
+        print "daemon_auto_start = false"
+        found_key = 1
+      }
+      in_features = ($0 ~ /^[[:space:]]*\[[[:space:]]*("features"|\047features\047|features)[[:space:]]*\][[:space:]]*(#.*)?$/)
+      if (in_features) found_table = 1
+    }
+    in_features && /^[[:space:]]*$/ {
+      blank_lines = blank_lines $0 ORS
+      next
+    }
+    in_features && /^[[:space:]]*("daemon_auto_start"|\047daemon_auto_start\047|daemon_auto_start)[[:space:]]*=/ {
+      sub(/=[[:space:]]*true/, "= false")
+      found_key = 1
+    }
+    {
+      printf "%s", blank_lines
+      blank_lines = ""
+      print
+    }
+    END {
+      if (!found_table) {
+        if (NR > 0) print ""
+        print "[features]"
+      }
+      if (!found_key) print "daemon_auto_start = false"
+      printf "%s", blank_lines
+    }
+  ' "$input" > "$tmpfile"; then
+    rm -f -- "$tmpfile"
+    return 1
+  fi
+
+  if [[ -f "$cfg" ]] && cmp -s -- "$cfg" "$tmpfile"; then
+    rm -f -- "$tmpfile"
+  elif ! mv -- "$tmpfile" "$cfg"; then
+    rm -f -- "$tmpfile"
+    return 1
+  fi
+  printf '%b[config] features.daemon_auto_start = false %b✓%b\n' "$DIM" "$GREEN" "$RESET"
+}
+
 check_current_auth_presence() {
   # An ACTIVE login already stored in auth.json needs no re-login. Only when
   # the credential file is missing (e.g. it lived in an OS keyring before the
@@ -1077,6 +1286,7 @@ cmd_login() {
   fi
 
   ensure_file_store_config
+  ensure_daemon_auto_start_disabled
   check_current_auth_presence
   upsert_current_auth_if_present
 
@@ -1119,6 +1329,7 @@ fi
 
 printf "${DIM}> %s${RESET}\n" "$(format_abs_time "$(date +%s)")"
 ensure_file_store_config
+ensure_daemon_auto_start_disabled
 check_current_auth_presence
 upsert_current_auth_if_present
 
@@ -1129,6 +1340,12 @@ else
 fi
 
 ensure_pool_file
+if [[ "$MODE" == "refresh" ]]; then
+  if ! refresh_pool_auth; then
+    exit 1
+  fi
+  exit 0
+fi
 build_results
 
 run_merged
